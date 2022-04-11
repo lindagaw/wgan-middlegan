@@ -4,27 +4,17 @@ sys.path.append(os.getcwd())
 import time
 
 import numpy as np
-
-import torch
-import torch.autograd as autograd
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+import tensorflow as tf
 
 import language_helpers
 import tflib as lib
+import tflib.ops.linear
+import tflib.ops.conv1d
 import tflib.plot
-
-from sklearn.preprocessing import OneHotEncoder
-
-torch.manual_seed(1)
-use_cuda = torch.cuda.is_available()
-if use_cuda:
-    gpu = 0
 
 # Download Google Billion Word at http://www.statmt.org/lm-benchmark/ and
 # fill in the path to the extracted files here!
-DATA_DIR = './data_language'
+DATA_DIR = ''
 if len(DATA_DIR) == 0:
     raise Exception('Please specify path to data directory in gan_language.py!')
 
@@ -37,10 +27,9 @@ CRITIC_ITERS = 10 # How many critic iterations per generator iteration. We
                   # use 10 for the results in the paper, but 5 should work fine
                   # as well.
 LAMBDA = 10 # Gradient penalty lambda hyperparameter.
-MAX_N_EXAMPLES = 10000000#10000000 # Max number of data examples to load. If data loading
+MAX_N_EXAMPLES = 10000000 # Max number of data examples to load. If data loading
                           # is too slow or takes too much RAM, you can decrease
                           # this (at the expense of having less training data).
-
 
 lib.print_model_settings(locals().copy())
 
@@ -50,82 +39,80 @@ lines, charmap, inv_charmap = language_helpers.load_dataset(
     data_dir=DATA_DIR
 )
 
-table = np.arange(len(charmap)).reshape(-1, 1)
-one_hot = OneHotEncoder()
-one_hot.fit(table)
+def softmax(logits):
+    return tf.reshape(
+        tf.nn.softmax(
+            tf.reshape(logits, [-1, len(charmap)])
+        ),
+        tf.shape(logits)
+    )
 
-# ==================Definition Start======================
+def make_noise(shape):
+    return tf.random_normal(shape)
 
-def make_noise(shape, volatile=False):
-    tensor = torch.randn(shape).cuda(gpu) if use_cuda else torch.randn(shape)
-    return autograd.Variable(tensor, volatile)
+def ResBlock(name, inputs):
+    output = inputs
+    output = tf.nn.relu(output)
+    output = lib.ops.conv1d.Conv1D(name+'.1', DIM, DIM, 5, output)
+    output = tf.nn.relu(output)
+    output = lib.ops.conv1d.Conv1D(name+'.2', DIM, DIM, 5, output)
+    return inputs + (0.3*output)
 
-class ResBlock(nn.Module):
+def Generator(n_samples, prev_outputs=None):
+    output = make_noise(shape=[n_samples, 128])
+    output = lib.ops.linear.Linear('Generator.Input', 128, SEQ_LEN*DIM, output)
+    output = tf.reshape(output, [-1, DIM, SEQ_LEN])
+    output = ResBlock('Generator.1', output)
+    output = ResBlock('Generator.2', output)
+    output = ResBlock('Generator.3', output)
+    output = ResBlock('Generator.4', output)
+    output = ResBlock('Generator.5', output)
+    output = lib.ops.conv1d.Conv1D('Generator.Output', DIM, len(charmap), 1, output)
+    output = tf.transpose(output, [0, 2, 1])
+    output = softmax(output)
+    return output
 
-    def __init__(self):
-        super(ResBlock, self).__init__()
+def Discriminator(inputs):
+    output = tf.transpose(inputs, [0,2,1])
+    output = lib.ops.conv1d.Conv1D('Discriminator.Input', len(charmap), DIM, 1, output)
+    output = ResBlock('Discriminator.1', output)
+    output = ResBlock('Discriminator.2', output)
+    output = ResBlock('Discriminator.3', output)
+    output = ResBlock('Discriminator.4', output)
+    output = ResBlock('Discriminator.5', output)
+    output = tf.reshape(output, [-1, SEQ_LEN*DIM])
+    output = lib.ops.linear.Linear('Discriminator.Output', SEQ_LEN*DIM, 1, output)
+    return output
 
-        self.res_block = nn.Sequential(
-            nn.ReLU(True),
-            nn.Conv1d(DIM, DIM, 5, padding=2),#nn.Linear(DIM, DIM),
-            nn.ReLU(True),
-            nn.Conv1d(DIM, DIM, 5, padding=2),#nn.Linear(DIM, DIM),
-        )
+real_inputs_discrete = tf.placeholder(tf.int32, shape=[BATCH_SIZE, SEQ_LEN])
+real_inputs = tf.one_hot(real_inputs_discrete, len(charmap))
+fake_inputs = Generator(BATCH_SIZE)
+fake_inputs_discrete = tf.argmax(fake_inputs, fake_inputs.get_shape().ndims-1)
 
-    def forward(self, input):
-        output = self.res_block(input)
-        return input + (0.3*output)
+disc_real = Discriminator(real_inputs) 
+disc_fake = Discriminator(fake_inputs)
 
-class Generator(nn.Module):
+disc_cost = tf.reduce_mean(disc_fake) - tf.reduce_mean(disc_real)
+gen_cost = -tf.reduce_mean(disc_fake)
 
-    def __init__(self):
-        super(Generator, self).__init__()
+# WGAN lipschitz-penalty
+alpha = tf.random_uniform(
+    shape=[BATCH_SIZE,1,1], 
+    minval=0.,
+    maxval=1.
+)
+differences = fake_inputs - real_inputs
+interpolates = real_inputs + (alpha*differences)
+gradients = tf.gradients(Discriminator(interpolates), [interpolates])[0]
+slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), reduction_indices=[1,2]))
+gradient_penalty = tf.reduce_mean((slopes-1.)**2)
+disc_cost += LAMBDA*gradient_penalty
 
-        self.fc1 = nn.Linear(128, DIM*SEQ_LEN)
-        self.block = nn.Sequential(
-            ResBlock(),
-            ResBlock(),
-            ResBlock(),
-            ResBlock(),
-            ResBlock(),
-        )
-        self.conv1 = nn.Conv1d(DIM, len(charmap), 1)
-        self.softmax = nn.Softmax()
+gen_params = lib.params_with_name('Generator')
+disc_params = lib.params_with_name('Discriminator')
 
-    def forward(self, noise):
-        output = self.fc1(noise)
-        output = output.view(-1, DIM, SEQ_LEN) # (BATCH_SIZE, DIM, SEQ_LEN)
-        output = self.block(output)
-        output = self.conv1(output)
-        output = output.transpose(1, 2)
-        shape = output.size()
-        output = output.contiguous()
-        output = output.view(BATCH_SIZE*SEQ_LEN, -1)
-        output = self.softmax(output)
-        return output.view(shape) # (BATCH_SIZE, SEQ_LEN, len(charmap))
-
-class Discriminator(nn.Module):
-
-    def __init__(self):
-        super(Discriminator, self).__init__()
-
-        self.block = nn.Sequential(
-            ResBlock(),
-            ResBlock(),
-            ResBlock(),
-            ResBlock(),
-            ResBlock(),
-        )
-        self.conv1d = nn.Conv1d(len(charmap), DIM, 1)
-        self.linear = nn.Linear(SEQ_LEN*DIM, 1)
-
-    def forward(self, input):
-        output = input.transpose(1, 2) # (BATCH_SIZE, len(charmap), SEQ_LEN)
-        output = self.conv1d(output)
-        output = self.block(output)
-        output = output.view(-1, SEQ_LEN*DIM)
-        output = self.linear(output)
-        return output
+gen_train_op = tf.train.AdamOptimizer(learning_rate=1e-4, beta1=0.5, beta2=0.9).minimize(gen_cost, var_list=gen_params)
+disc_train_op = tf.train.AdamOptimizer(learning_rate=1e-4, beta1=0.5, beta2=0.9).minimize(disc_cost, var_list=disc_params)
 
 # Dataset iterator
 def inf_train_gen():
@@ -133,73 +120,9 @@ def inf_train_gen():
         np.random.shuffle(lines)
         for i in xrange(0, len(lines)-BATCH_SIZE+1, BATCH_SIZE):
             yield np.array(
-                [[charmap[c] for c in l] for l in lines[i:i+BATCH_SIZE]],
+                [[charmap[c] for c in l] for l in lines[i:i+BATCH_SIZE]], 
                 dtype='int32'
             )
-
-def calc_gradient_penalty(netD, real_data, fake_data):
-    alpha = torch.rand(BATCH_SIZE, 1, 1)
-    alpha = alpha.expand(real_data.size())
-    alpha = alpha.cuda(gpu) if use_cuda else alpha
-
-    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
-
-    if use_cuda:
-        interpolates = interpolates.cuda(gpu)
-    interpolates = autograd.Variable(interpolates, requires_grad=True)
-
-    disc_interpolates = netD(interpolates)
-
-    # TODO: Make ConvBackward diffentiable
-    gradients = autograd.grad(outputs=disc_interpolates, inputs=interpolates,
-                              grad_outputs=torch.ones(disc_interpolates.size()).cuda(gpu) if use_cuda else torch.ones(
-                                  disc_interpolates.size()),
-                              create_graph=True, retain_graph=True, only_inputs=True)[0]
-
-    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
-    return gradient_penalty
-
-def generate_samples(netG):
-    noise = torch.randn(BATCH_SIZE, 128)
-    if use_cuda:
-        noise = noise.cuda(gpu)
-    noisev = autograd.Variable(noise, volatile=True)
-    samples = netG(noisev)
-    samples = samples.view(-1, SEQ_LEN, len(charmap))
-    # print samples.size()
-
-    samples = samples.cpu().data.numpy()
-
-    samples = np.argmax(samples, axis=2)
-    decoded_samples = []
-    for i in xrange(len(samples)):
-        decoded = []
-        for j in xrange(len(samples[i])):
-            decoded.append(inv_charmap[samples[i][j]])
-        decoded_samples.append(tuple(decoded))
-    return decoded_samples
-
-# ==================Definition End======================
-
-netG = Generator()
-netD = Discriminator()
-print netG
-print netD
-
-if use_cuda:
-    netD = netD.cuda(gpu)
-    netG = netG.cuda(gpu)
-
-optimizerD = optim.Adam(netD.parameters(), lr=1e-4, betas=(0.5, 0.9))
-optimizerG = optim.Adam(netG.parameters(), lr=1e-4, betas=(0.5, 0.9))
-
-one = torch.FloatTensor([1])
-mone = one * -1
-if use_cuda:
-    one = one.cuda(gpu)
-    mone = mone.cuda(gpu)
-
-data = inf_train_gen()
 
 # During training we monitor JS divergence between the true & generated ngram
 # distributions for n=1,2,3,4. To get an idea of the optimal values, we
@@ -210,91 +133,56 @@ for i in xrange(4):
     print "validation set JSD for n={}: {}".format(i+1, true_char_ngram_lms[i].js_with(validation_char_ngram_lms[i]))
 true_char_ngram_lms = [language_helpers.NgramLanguageModel(i+1, lines, tokenize=False) for i in xrange(4)]
 
-for iteration in xrange(ITERS):
-    start_time = time.time()
-    ############################
-    # (1) Update D network
-    ###########################
-    for p in netD.parameters():  # reset requires_grad
-        p.requires_grad = True  # they are set to False below in netG update
+with tf.Session() as session:
 
-    for iter_d in xrange(CRITIC_ITERS):
-        _data = data.next()
-        data_one_hot = one_hot.transform(_data.reshape(-1, 1)).toarray().reshape(BATCH_SIZE, -1, len(charmap))
-        #print data_one_hot.shape
-        real_data = torch.Tensor(data_one_hot)
-        if use_cuda:
-            real_data = real_data.cuda(gpu)
-        real_data_v = autograd.Variable(real_data)
+    session.run(tf.initialize_all_variables())
 
-        netD.zero_grad()
+    def generate_samples():
+        samples = session.run(fake_inputs)
+        samples = np.argmax(samples, axis=2)
+        decoded_samples = []
+        for i in xrange(len(samples)):
+            decoded = []
+            for j in xrange(len(samples[i])):
+                decoded.append(inv_charmap[samples[i][j]])
+            decoded_samples.append(tuple(decoded))
+        return decoded_samples
 
-        # train with real
-        D_real = netD(real_data_v)
-        D_real = D_real.mean()
-        # print D_real
-        # TODO: Waiting for the bug fix from pytorch
-        D_real.backward(mone)
+    gen = inf_train_gen()
 
-        # train with fake
-        noise = torch.randn(BATCH_SIZE, 128)
-        if use_cuda:
-            noise = noise.cuda(gpu)
-        noisev = autograd.Variable(noise, volatile=True)  # totally freeze netG
-        fake = autograd.Variable(netG(noisev).data)
-        inputv = fake
-        D_fake = netD(inputv)
-        D_fake = D_fake.mean()
-        # TODO: Waiting for the bug fix from pytorch
-        D_fake.backward(one)
+    for iteration in xrange(ITERS):
+        start_time = time.time()
 
-        # train with gradient penalty
-        gradient_penalty = calc_gradient_penalty(netD, real_data_v.data, fake.data)
-        gradient_penalty.backward()
+        # Train generator
+        if iteration > 0:
+            _ = session.run(gen_train_op)
 
-        D_cost = D_fake - D_real + gradient_penalty
-        Wasserstein_D = D_real - D_fake
-        optimizerD.step()
+        # Train critic
+        for i in xrange(CRITIC_ITERS):
+            _data = gen.next()
+            _disc_cost, _ = session.run(
+                [disc_cost, disc_train_op],
+                feed_dict={real_inputs_discrete:_data}
+            )
 
-    ############################
-    # (2) Update G network
-    ###########################
-    for p in netD.parameters():
-        p.requires_grad = False  # to avoid computation
-    netG.zero_grad()
+        lib.plot.plot('time', time.time() - start_time)
+        lib.plot.plot('train disc cost', _disc_cost)
 
-    noise = torch.randn(BATCH_SIZE, 128)
-    if use_cuda:
-        noise = noise.cuda(gpu)
-    noisev = autograd.Variable(noise)
-    fake = netG(noisev)
-    G = netD(fake)
-    G = G.mean()
-    G.backward(mone)
-    G_cost = -G
-    optimizerG.step()
+        if iteration % 100 == 99:
+            samples = []
+            for i in xrange(10):
+                samples.extend(generate_samples())
 
-    # Write logs and save samples
-    lib.plot.plot('tmp/lang/time', time.time() - start_time)
-    lib.plot.plot('tmp/lang/train disc cost', D_cost.cpu().data.numpy())
-    lib.plot.plot('tmp/lang/train gen cost', G_cost.cpu().data.numpy())
-    lib.plot.plot('tmp/lang/wasserstein distance', Wasserstein_D.cpu().data.numpy())
+            for i in xrange(4):
+                lm = language_helpers.NgramLanguageModel(i+1, samples, tokenize=False)
+                lib.plot.plot('js{}'.format(i+1), lm.js_with(true_char_ngram_lms[i]))
 
-    if iteration % 100 == 99:
-        samples = []
-        for i in xrange(10):
-            samples.extend(generate_samples(netG))
+            with open('samples_{}.txt'.format(iteration), 'w') as f:
+                for s in samples:
+                    s = "".join(s)
+                    f.write(s + "\n")
 
-        for i in xrange(4):
-            lm = language_helpers.NgramLanguageModel(i+1, samples, tokenize=False)
-            lib.plot.plot('tmp/lang/js{}'.format(i+1), lm.js_with(true_char_ngram_lms[i]))
-
-        with open('tmp/lang/samples_{}.txt'.format(iteration), 'w') as f:
-            for s in samples:
-                s = "".join(s)
-                f.write(s + "\n")
-
-    if iteration % 100 == 99:
-        lib.plot.flush()
-
-    lib.plot.tick()
+        if iteration % 100 == 99:
+            lib.plot.flush()
+        
+        lib.plot.tick()

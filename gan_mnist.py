@@ -8,115 +8,193 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import sklearn.datasets
+import tensorflow as tf
 
 import tflib as lib
+import tflib.ops.linear
+import tflib.ops.conv2d
+import tflib.ops.batchnorm
+import tflib.ops.deconv2d
 import tflib.save_images
 import tflib.mnist
 import tflib.plot
 
-import torch
-import torch.autograd as autograd
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-
-torch.manual_seed(1)
-use_cuda = torch.cuda.is_available()
-if use_cuda:
-    gpu = 0
-
+MODE = 'wgan-gp' # dcgan, wgan, or wgan-gp
 DIM = 64 # Model dimensionality
 BATCH_SIZE = 50 # Batch size
 CRITIC_ITERS = 5 # For WGAN and WGAN-GP, number of critic iters per gen iter
 LAMBDA = 10 # Gradient penalty lambda hyperparameter
-ITERS = 200000 # How many generator iterations to train for
+ITERS = 200000 # How many generator iterations to train for 
 OUTPUT_DIM = 784 # Number of pixels in MNIST (28*28)
 
 lib.print_model_settings(locals().copy())
 
-# ==================Definition Start======================
-class Generator(nn.Module):
-    def __init__(self):
-        super(Generator, self).__init__()
+def LeakyReLU(x, alpha=0.2):
+    return tf.maximum(alpha*x, x)
 
-        preprocess = nn.Sequential(
-            nn.Linear(128, 4*4*4*DIM),
-            nn.ReLU(True),
+def ReLULayer(name, n_in, n_out, inputs):
+    output = lib.ops.linear.Linear(
+        name+'.Linear', 
+        n_in, 
+        n_out, 
+        inputs,
+        initialization='he'
+    )
+    return tf.nn.relu(output)
+
+def LeakyReLULayer(name, n_in, n_out, inputs):
+    output = lib.ops.linear.Linear(
+        name+'.Linear', 
+        n_in, 
+        n_out, 
+        inputs,
+        initialization='he'
+    )
+    return LeakyReLU(output)
+
+def Generator(n_samples, noise=None):
+    if noise is None:
+        noise = tf.random_normal([n_samples, 128])
+
+    output = lib.ops.linear.Linear('Generator.Input', 128, 4*4*4*DIM, noise)
+    if MODE == 'wgan':
+        output = lib.ops.batchnorm.Batchnorm('Generator.BN1', [0], output)
+    output = tf.nn.relu(output)
+    output = tf.reshape(output, [-1, 4*DIM, 4, 4])
+
+    output = lib.ops.deconv2d.Deconv2D('Generator.2', 4*DIM, 2*DIM, 5, output)
+    if MODE == 'wgan':
+        output = lib.ops.batchnorm.Batchnorm('Generator.BN2', [0,2,3], output)
+    output = tf.nn.relu(output)
+
+    output = output[:,:,:7,:7]
+
+    output = lib.ops.deconv2d.Deconv2D('Generator.3', 2*DIM, DIM, 5, output)
+    if MODE == 'wgan':
+        output = lib.ops.batchnorm.Batchnorm('Generator.BN3', [0,2,3], output)
+    output = tf.nn.relu(output)
+
+    output = lib.ops.deconv2d.Deconv2D('Generator.5', DIM, 1, 5, output)
+    output = tf.nn.sigmoid(output)
+
+    return tf.reshape(output, [-1, OUTPUT_DIM])
+
+def Discriminator(inputs):
+    output = tf.reshape(inputs, [-1, 1, 28, 28])
+
+    output = lib.ops.conv2d.Conv2D('Discriminator.1',1,DIM,5,output,stride=2)
+    output = LeakyReLU(output)
+
+    output = lib.ops.conv2d.Conv2D('Discriminator.2', DIM, 2*DIM, 5, output, stride=2)
+    if MODE == 'wgan':
+        output = lib.ops.batchnorm.Batchnorm('Discriminator.BN2', [0,2,3], output)
+    output = LeakyReLU(output)
+
+    output = lib.ops.conv2d.Conv2D('Discriminator.3', 2*DIM, 4*DIM, 5, output, stride=2)
+    if MODE == 'wgan':
+        output = lib.ops.batchnorm.Batchnorm('Discriminator.BN3', [0,2,3], output)
+    output = LeakyReLU(output)
+
+    output = tf.reshape(output, [-1, 4*4*4*DIM])
+    output = lib.ops.linear.Linear('Discriminator.Output', 4*4*4*DIM, 1, output)
+
+    return tf.reshape(output, [-1])
+
+real_data = tf.placeholder(tf.float32, shape=[BATCH_SIZE, OUTPUT_DIM])
+fake_data = Generator(BATCH_SIZE)
+
+disc_real = Discriminator(real_data)
+disc_fake = Discriminator(fake_data)
+
+gen_params = lib.params_with_name('Generator')
+disc_params = lib.params_with_name('Discriminator')
+
+if MODE == 'wgan':
+    gen_cost = -tf.reduce_mean(disc_fake)
+    disc_cost = tf.reduce_mean(disc_fake) - tf.reduce_mean(disc_real)
+
+    gen_train_op = tf.train.RMSPropOptimizer(
+        learning_rate=5e-5
+    ).minimize(gen_cost, var_list=gen_params)
+    disc_train_op = tf.train.RMSPropOptimizer(
+        learning_rate=5e-5
+    ).minimize(disc_cost, var_list=disc_params)
+
+    clip_ops = []
+    for var in lib.params_with_name('Discriminator'):
+        clip_bounds = [-.01, .01]
+        clip_ops.append(
+            tf.assign(
+                var, 
+                tf.clip_by_value(var, clip_bounds[0], clip_bounds[1])
+            )
         )
-        block1 = nn.Sequential(
-            nn.ConvTranspose2d(4*DIM, 2*DIM, 5),
-            nn.ReLU(True),
-        )
-        block2 = nn.Sequential(
-            nn.ConvTranspose2d(2*DIM, DIM, 5),
-            nn.ReLU(True),
-        )
-        deconv_out = nn.ConvTranspose2d(DIM, 1, 8, stride=2)
+    clip_disc_weights = tf.group(*clip_ops)
 
-        self.block1 = block1
-        self.block2 = block2
-        self.deconv_out = deconv_out
-        self.preprocess = preprocess
-        self.sigmoid = nn.Sigmoid()
+elif MODE == 'wgan-gp':
+    gen_cost = -tf.reduce_mean(disc_fake)
+    disc_cost = tf.reduce_mean(disc_fake) - tf.reduce_mean(disc_real)
 
-    def forward(self, input):
-        output = self.preprocess(input)
-        output = output.view(-1, 4*DIM, 4, 4)
-        #print output.size()
-        output = self.block1(output)
-        #print output.size()
-        output = output[:, :, :7, :7]
-        #print output.size()
-        output = self.block2(output)
-        #print output.size()
-        output = self.deconv_out(output)
-        output = self.sigmoid(output)
-        #print output.size()
-        return output.view(-1, OUTPUT_DIM)
+    alpha = tf.random_uniform(
+        shape=[BATCH_SIZE,1], 
+        minval=0.,
+        maxval=1.
+    )
+    differences = fake_data - real_data
+    interpolates = real_data + (alpha*differences)
+    gradients = tf.gradients(Discriminator(interpolates), [interpolates])[0]
+    slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), reduction_indices=[1]))
+    gradient_penalty = tf.reduce_mean((slopes-1.)**2)
+    disc_cost += LAMBDA*gradient_penalty
 
-class Discriminator(nn.Module):
-    def __init__(self):
-        super(Discriminator, self).__init__()
+    gen_train_op = tf.train.AdamOptimizer(
+        learning_rate=1e-4, 
+        beta1=0.5,
+        beta2=0.9
+    ).minimize(gen_cost, var_list=gen_params)
+    disc_train_op = tf.train.AdamOptimizer(
+        learning_rate=1e-4, 
+        beta1=0.5, 
+        beta2=0.9
+    ).minimize(disc_cost, var_list=disc_params)
 
-        main = nn.Sequential(
-            nn.Conv2d(1, DIM, 5, stride=2, padding=2),
-            # nn.Linear(OUTPUT_DIM, 4*4*4*DIM),
-            nn.ReLU(True),
-            nn.Conv2d(DIM, 2*DIM, 5, stride=2, padding=2),
-            # nn.Linear(4*4*4*DIM, 4*4*4*DIM),
-            nn.ReLU(True),
-            nn.Conv2d(2*DIM, 4*DIM, 5, stride=2, padding=2),
-            # nn.Linear(4*4*4*DIM, 4*4*4*DIM),
-            nn.ReLU(True),
-            # nn.Linear(4*4*4*DIM, 4*4*4*DIM),
-            # nn.LeakyReLU(True),
-            # nn.Linear(4*4*4*DIM, 4*4*4*DIM),
-            # nn.LeakyReLU(True),
-        )
-        self.main = main
-        self.output = nn.Linear(4*4*4*DIM, 1)
+    clip_disc_weights = None
 
-    def forward(self, input):
-        input = input.view(-1, 1, 28, 28)
-        out = self.main(input)
-        out = out.view(-1, 4*4*4*DIM)
-        out = self.output(out)
-        return out.view(-1)
+elif MODE == 'dcgan':
+    gen_cost = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        disc_fake, 
+        tf.ones_like(disc_fake)
+    ))
 
-def generate_image(frame, netG):
-    noise = torch.randn(BATCH_SIZE, 128)
-    if use_cuda:
-        noise = noise.cuda(gpu)
-    noisev = autograd.Variable(noise, volatile=True)
-    samples = netG(noisev)
-    samples = samples.view(BATCH_SIZE, 28, 28)
-    # print samples.size()
+    disc_cost =  tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        disc_fake, 
+        tf.zeros_like(disc_fake)
+    ))
+    disc_cost += tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+        disc_real, 
+        tf.ones_like(disc_real)
+    ))
+    disc_cost /= 2.
 
-    samples = samples.cpu().data.numpy()
+    gen_train_op = tf.train.AdamOptimizer(
+        learning_rate=2e-4, 
+        beta1=0.5
+    ).minimize(gen_cost, var_list=gen_params)
+    disc_train_op = tf.train.AdamOptimizer(
+        learning_rate=2e-4, 
+        beta1=0.5
+    ).minimize(disc_cost, var_list=disc_params)
 
+    clip_disc_weights = None
+
+# For saving samples
+fixed_noise = tf.constant(np.random.normal(size=(128, 128)).astype('float32'))
+fixed_noise_samples = Generator(128, noise=fixed_noise)
+def generate_image(frame, true_dist):
+    samples = session.run(fixed_noise_samples)
     lib.save_images.save_images(
-        samples,
-        'tmp/mnist/samples_{}.png'.format(frame)
+        samples.reshape((128, 28, 28)), 
+        'samples_{}.png'.format(frame)
     )
 
 # Dataset iterator
@@ -126,134 +204,50 @@ def inf_train_gen():
         for images,targets in train_gen():
             yield images
 
-def calc_gradient_penalty(netD, real_data, fake_data):
-    #print real_data.size()
-    alpha = torch.rand(BATCH_SIZE, 1)
-    alpha = alpha.expand(real_data.size())
-    alpha = alpha.cuda(gpu) if use_cuda else alpha
+# Train loop
+with tf.Session() as session:
 
-    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+    session.run(tf.initialize_all_variables())
 
-    if use_cuda:
-        interpolates = interpolates.cuda(gpu)
-    interpolates = autograd.Variable(interpolates, requires_grad=True)
+    gen = inf_train_gen()
 
-    disc_interpolates = netD(interpolates)
+    for iteration in xrange(ITERS):
+        start_time = time.time()
 
-    gradients = autograd.grad(outputs=disc_interpolates, inputs=interpolates,
-                              grad_outputs=torch.ones(disc_interpolates.size()).cuda(gpu) if use_cuda else torch.ones(
-                                  disc_interpolates.size()),
-                              create_graph=True, retain_graph=True, only_inputs=True)[0]
+        if iteration > 0:
+            _ = session.run(gen_train_op)
 
-    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
-    return gradient_penalty
+        if MODE == 'dcgan':
+            disc_iters = 1
+        else:
+            disc_iters = CRITIC_ITERS
+        for i in xrange(disc_iters):
+            _data = gen.next()
+            _disc_cost, _ = session.run(
+                [disc_cost, disc_train_op],
+                feed_dict={real_data: _data}
+            )
+            if clip_disc_weights is not None:
+                _ = session.run(clip_disc_weights)
 
-# ==================Definition End======================
+        lib.plot.plot('train disc cost', _disc_cost)
+        lib.plot.plot('time', time.time() - start_time)
 
-netG = Generator()
-netD = Discriminator()
-print netG
-print netD
+        # Calculate dev loss and generate samples every 100 iters
+        if iteration % 100 == 99:
+            dev_disc_costs = []
+            for images,_ in dev_gen():
+                _dev_disc_cost = session.run(
+                    disc_cost, 
+                    feed_dict={real_data: images}
+                )
+                dev_disc_costs.append(_dev_disc_cost)
+            lib.plot.plot('dev disc cost', np.mean(dev_disc_costs))
 
-if use_cuda:
-    netD = netD.cuda(gpu)
-    netG = netG.cuda(gpu)
+            generate_image(iteration, _data)
 
-optimizerD = optim.Adam(netD.parameters(), lr=1e-4, betas=(0.5, 0.9))
-optimizerG = optim.Adam(netG.parameters(), lr=1e-4, betas=(0.5, 0.9))
+        # Write logs every 100 iters
+        if (iteration < 5) or (iteration % 100 == 99):
+            lib.plot.flush()
 
-one = torch.FloatTensor([1])
-mone = one * -1
-if use_cuda:
-    one = one.cuda(gpu)
-    mone = mone.cuda(gpu)
-
-data = inf_train_gen()
-
-for iteration in xrange(ITERS):
-    start_time = time.time()
-    ############################
-    # (1) Update D network
-    ###########################
-    for p in netD.parameters():  # reset requires_grad
-        p.requires_grad = True  # they are set to False below in netG update
-
-    for iter_d in xrange(CRITIC_ITERS):
-        _data = data.next()
-        real_data = torch.Tensor(_data)
-        if use_cuda:
-            real_data = real_data.cuda(gpu)
-        real_data_v = autograd.Variable(real_data)
-
-        netD.zero_grad()
-
-        # train with real
-        D_real = netD(real_data_v)
-        D_real = D_real.mean()
-        # print D_real
-        D_real.backward(mone)
-
-        # train with fake
-        noise = torch.randn(BATCH_SIZE, 128)
-        if use_cuda:
-            noise = noise.cuda(gpu)
-        noisev = autograd.Variable(noise, volatile=True)  # totally freeze netG
-        fake = autograd.Variable(netG(noisev).data)
-        inputv = fake
-        D_fake = netD(inputv)
-        D_fake = D_fake.mean()
-        D_fake.backward(one)
-
-        # train with gradient penalty
-        gradient_penalty = calc_gradient_penalty(netD, real_data_v.data, fake.data)
-        gradient_penalty.backward()
-
-        D_cost = D_fake - D_real + gradient_penalty
-        Wasserstein_D = D_real - D_fake
-        optimizerD.step()
-
-    ############################
-    # (2) Update G network
-    ###########################
-    for p in netD.parameters():
-        p.requires_grad = False  # to avoid computation
-    netG.zero_grad()
-
-    noise = torch.randn(BATCH_SIZE, 128)
-    if use_cuda:
-        noise = noise.cuda(gpu)
-    noisev = autograd.Variable(noise)
-    fake = netG(noisev)
-    G = netD(fake)
-    G = G.mean()
-    G.backward(mone)
-    G_cost = -G
-    optimizerG.step()
-
-    # Write logs and save samples
-    lib.plot.plot('tmp/mnist/time', time.time() - start_time)
-    lib.plot.plot('tmp/mnist/train disc cost', D_cost.cpu().data.numpy())
-    lib.plot.plot('tmp/mnist/train gen cost', G_cost.cpu().data.numpy())
-    lib.plot.plot('tmp/mnist/wasserstein distance', Wasserstein_D.cpu().data.numpy())
-
-    # Calculate dev loss and generate samples every 100 iters
-    if iteration % 100 == 99:
-        dev_disc_costs = []
-        for images,_ in dev_gen():
-            imgs = torch.Tensor(images)
-            if use_cuda:
-                imgs = imgs.cuda(gpu)
-            imgs_v = autograd.Variable(imgs, volatile=True)
-
-            D = netD(imgs_v)
-            _dev_disc_cost = -D.mean().cpu().data.numpy()
-            dev_disc_costs.append(_dev_disc_cost)
-        lib.plot.plot('tmp/mnist/dev disc cost', np.mean(dev_disc_costs))
-
-        generate_image(iteration, netG)
-
-    # Write logs every 100 iters
-    if (iteration < 5) or (iteration % 100 == 99):
-        lib.plot.flush()
-
-    lib.plot.tick()
+        lib.plot.tick()
